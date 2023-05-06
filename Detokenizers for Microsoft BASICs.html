@@ -1,0 +1,679 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html lang="en"><script type="text/javascript">try {
+(function injectPageScriptAPI(scriptName, shouldOverrideWebSocket, shouldOverrideWebRTC, isInjected) { 
+
+    'use strict';
+
+    /**
+     * If script have been injected into a frame via contentWindow then we can simply take the copy of messageChannel left for us by parent document
+     * Otherwise creates new message channel that sends a message to the content-script to check if request should be allowed or not.
+     */
+    var messageChannel = isInjected ? window[scriptName] : (function () {
+
+        // Save original postMessage and addEventListener functions to prevent webpage from tampering both.
+        var postMessage = window.postMessage;
+        var addEventListener = window.addEventListener;
+
+        // Current request ID (incremented every time we send a new message)
+        var currentRequestId = 0;
+        var requestsMap = {};
+
+        /**
+         * Handles messages sent from the content script back to the page script.
+         *
+         * @param event Event with necessary data
+         */
+        var onMessageReceived = function (event) {
+
+            if (!event.data || !event.data.direction || event.data.direction !== "to-page-script@abu") {
+                return;
+            }
+
+            var requestData = requestsMap[event.data.requestId];
+            if (requestData) {
+                var wrapper = requestData.wrapper;
+                requestData.onResponseReceived(wrapper, event.data.block);
+                delete requestsMap[event.data.requestId];
+            }
+        };
+
+        /**
+         * @param url                The URL to which wrapped object is willing to connect
+         * @param requestType        Request type ( WEBSOCKET or WEBRTC)
+         * @param wrapper            WebSocket wrapper instance
+         * @param onResponseReceived Called when response is received
+         */
+        var sendMessage = function (url, requestType, wrapper, onResponseReceived) {
+
+            if (currentRequestId === 0) {
+                // Subscribe to response when this method is called for the first time
+                addEventListener.call(window, "message", onMessageReceived, false);
+            }
+
+            var requestId = ++currentRequestId;
+            requestsMap[requestId] = {
+                wrapper: wrapper,
+                onResponseReceived: onResponseReceived
+            };
+
+            var message = {
+                requestId: requestId,
+                direction: 'from-page-script@abu',
+                elementUrl: url,
+                documentUrl: document.URL,
+                requestType: requestType
+            };
+
+            // Send a message to the background page to check if the request should be blocked
+            postMessage.call(window, message, "*");
+        };
+
+        return {
+            sendMessage: sendMessage
+        };
+
+    })();
+
+    /*
+     * In some case Chrome won't run content scripts inside frames.
+     * So we have to intercept access to contentWindow/contentDocument and manually inject wrapper script into this context
+     *
+     * Based on: https://github.com/adblockplus/adblockpluschrome/commit/1aabfb3346dc0821c52dd9e97f7d61b8c99cd707
+     */
+    var injectedToString = Function.prototype.toString.bind(injectPageScriptAPI);
+
+    var injectedFramesAdd;
+    var injectedFramesHas;
+    if (window.WeakSet instanceof Function) {
+        var injectedFrames = new WeakSet();
+        injectedFramesAdd = WeakSet.prototype.add.bind(injectedFrames);
+        injectedFramesHas = WeakSet.prototype.has.bind(injectedFrames);
+    } else {
+        var frames = [];
+        injectedFramesAdd = function (el) {
+            if (frames.indexOf(el) < 0) {
+                frames.push(el);
+            }
+        };
+        injectedFramesHas = function (el) {
+            return frames.indexOf(el) >= 0;
+        };
+    }
+
+    /**
+     * Injects wrapper's script into passed window
+     * @param contentWindow Frame's content window
+     */
+    function injectPageScriptAPIInWindow(contentWindow) {
+        try {
+            if (contentWindow && !injectedFramesHas(contentWindow)) {
+                injectedFramesAdd(contentWindow);
+                contentWindow[scriptName] = messageChannel; // Left message channel for the injected script
+                var args = "'" + scriptName + "', " + shouldOverrideWebSocket + ", " + shouldOverrideWebRTC + ", true";
+                contentWindow.eval("(" + injectedToString() + ")(" + args + ");");
+                delete contentWindow[scriptName];
+            }
+        } catch (e) {
+        }
+    }
+
+    /**
+     * Overrides access to contentWindow/contentDocument for the passed HTML element's interface (iframe, frame, object)
+     * If the content of one of these objects is requested we will inject our wrapper script.
+     * @param iface HTML element's interface
+     */
+    function overrideContentAccess(iface) {
+
+        var contentWindowDescriptor = Object.getOwnPropertyDescriptor(iface.prototype, "contentWindow");
+        var contentDocumentDescriptor = Object.getOwnPropertyDescriptor(iface.prototype, "contentDocument");
+
+        // Apparently in HTMLObjectElement.prototype.contentWindow does not exist
+        // in older versions of Chrome such as 42.
+        if (!contentWindowDescriptor) {
+            return;
+        }
+
+        var getContentWindow = Function.prototype.call.bind(contentWindowDescriptor.get);
+        var getContentDocument = Function.prototype.call.bind(contentDocumentDescriptor.get);
+
+        contentWindowDescriptor.get = function () {
+            var contentWindow = getContentWindow(this);
+            injectPageScriptAPIInWindow(contentWindow);
+            return contentWindow;
+        };
+        contentDocumentDescriptor.get = function () {
+            injectPageScriptAPIInWindow(getContentWindow(this));
+            return getContentDocument(this);
+        };
+
+        Object.defineProperty(iface.prototype, "contentWindow", contentWindowDescriptor);
+        Object.defineProperty(iface.prototype, "contentDocument", contentDocumentDescriptor);
+    }
+
+    var interfaces = [HTMLFrameElement, HTMLIFrameElement, HTMLObjectElement];
+    for (var i = 0; i < interfaces.length; i++) {
+        overrideContentAccess(interfaces[i]);
+    }
+
+    /**
+     * Defines properties in destination object
+     * @param src Source object
+     * @param dest Destination object
+     * @param properties Properties to copy
+     */
+    var copyProperties = function (src, dest, properties) {
+        for (var i = 0; i < properties.length; i++) {
+            var prop = properties[i];
+            var descriptor = Object.getOwnPropertyDescriptor(src, prop);
+            // Passed property may be undefined
+            if (descriptor) {
+                Object.defineProperty(dest, prop, descriptor);
+            }
+        }
+    };
+
+    /**
+     * Check request by sending message to content script
+     * @param url URL to block
+     * @param type Request type
+     * @param callback Result callback
+     */
+    var checkRequest = function (url, type, callback) {
+        messageChannel.sendMessage(url, type, this, function (wrapper, blockConnection) {
+            callback(blockConnection);
+        });
+    };
+
+    /**
+     * The function overrides window.WebSocket with our wrapper, that will check url with filters through messaging with content-script.
+     *
+     * IMPORTANT NOTE:
+     * This function is first loaded as a content script. The only purpose of it is to call
+     * the "toString" method and use resulting string as a text content for injected script.
+     */
+    var overrideWebSocket = function () { 
+
+        if (!(window.WebSocket instanceof Function)) {
+            return;
+        }
+
+        /**
+         * WebSocket wrapper implementation.
+         * https://github.com/AdguardTeam/AdguardBrowserExtension/issues/349
+         *
+         * Based on:
+         * https://github.com/adblockplus/adblockpluschrome/commit/457a336ee55a433217c3ffe5d363e5c6980f26f4
+         */
+
+        /**
+         * As far as possible we must track everything we use that could be sabotaged by the website later in order to circumvent us.
+         */
+        var RealWebSocket = WebSocket;
+        var closeWebSocket = Function.prototype.call.bind(RealWebSocket.prototype.close);
+
+        function WrappedWebSocket(url, protocols) {
+            // Throw correct exceptions if the constructor is used improperly.
+            if (!(this instanceof WrappedWebSocket)) {
+                return RealWebSocket();
+            }
+            if (arguments.length < 1) {
+                return new RealWebSocket();
+            }
+
+            var websocket = new RealWebSocket(url, protocols);
+
+            // This is the key point: checking if this WS should be blocked or not
+            // Don't forget that the type of 'websocket.url' is String, but 'url 'parameter might have another type.
+            checkRequest(websocket.url, 'WEBSOCKET', function (blocked) {
+                if (blocked) {
+                    closeWebSocket(websocket);
+                }
+            });
+
+            return websocket;
+        }
+
+        // https://github.com/AdguardTeam/AdguardBrowserExtension/issues/488
+        WrappedWebSocket.prototype = RealWebSocket.prototype;
+        window.WebSocket = WrappedWebSocket.bind();
+
+        copyProperties(RealWebSocket, WebSocket, ["CONNECTING", "OPEN", "CLOSING", "CLOSED", "name", "prototype"]);
+
+        RealWebSocket.prototype.constructor = WebSocket;
+
+    };
+
+    /**
+     * The function overrides window.RTCPeerConnection with our wrapper, that will check ice servers URLs with filters through messaging with content-script.
+     *
+     * IMPORTANT NOTE:
+     * This function is first loaded as a content script. The only purpose of it is to call
+     * the "toString" method and use resulting string as a text content for injected script.
+     */
+    var overrideWebRTC = function () { 
+
+
+        if (!(window.RTCPeerConnection instanceof Function) &&
+            !(window.webkitRTCPeerConnection instanceof Function)) {
+            return;
+        }
+
+        /**
+         * RTCPeerConnection wrapper implementation.
+         * https://github.com/AdguardTeam/AdguardBrowserExtension/issues/588
+         *
+         * Based on:
+         * https://github.com/adblockplus/adblockpluschrome/commit/af0585137be19011eace1cf68bf61eed2e6db974
+         *
+         * Chromium webRequest API doesn't allow the blocking of WebRTC connections
+         * https://bugs.chromium.org/p/chromium/issues/detail?id=707683
+         */
+
+        var RealRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+        var closeRTCPeerConnection = Function.prototype.call.bind(RealRTCPeerConnection.prototype.close);
+
+        var RealArray = Array;
+        var RealString = String;
+        var createObject = Object.create;
+        var defineProperty = Object.defineProperty;
+
+        /**
+         * Convert passed url to string
+         * @param url URL
+         * @returns {string}
+         */
+        function urlToString(url) {
+            if (typeof url !== "undefined") {
+                return RealString(url);
+            }
+        }
+
+        /**
+         * Creates new immutable array from original with some transform function
+         * @param original
+         * @param transform
+         * @returns {*}
+         */
+        function safeCopyArray(original, transform) {
+
+            if (original === null || typeof original !== "object") {
+                return original;
+            }
+
+            var immutable = RealArray(original.length);
+            for (var i = 0; i < immutable.length; i++) {
+                defineProperty(immutable, i, {
+                    configurable: false, enumerable: false, writable: false,
+                    value: transform(original[i])
+                });
+            }
+            defineProperty(immutable, "length", {
+                configurable: false, enumerable: false, writable: false,
+                value: immutable.length
+            });
+            return immutable;
+        }
+
+        /**
+         * Protect configuration from mutations
+         * @param configuration RTCPeerConnection configuration object
+         * @returns {*}
+         */
+        function protectConfiguration(configuration) {
+
+            if (configuration === null || typeof configuration !== "object") {
+                return configuration;
+            }
+
+            var iceServers = safeCopyArray(
+                configuration.iceServers,
+                function (iceServer) {
+
+                    var url = iceServer.url;
+                    var urls = iceServer.urls;
+
+                    // RTCPeerConnection doesn't iterate through pseudo Arrays of urls.
+                    if (typeof urls !== "undefined" && !(urls instanceof RealArray)) {
+                        urls = [urls];
+                    }
+
+                    return createObject(iceServer, {
+                        url: {
+                            configurable: false, enumerable: false, writable: false,
+                            value: urlToString(url)
+                        },
+                        urls: {
+                            configurable: false, enumerable: false, writable: false,
+                            value: safeCopyArray(urls, urlToString)
+                        }
+                    });
+                }
+            );
+
+            return createObject(configuration, {
+                iceServers: {
+                    configurable: false, enumerable: false, writable: false,
+                    value: iceServers
+                }
+            });
+        }
+
+        /**
+         * Check WebRTC connection's URL and close if it's blocked by rule
+         * @param connection Connection
+         * @param url URL to check
+         */
+        function checkWebRTCRequest(connection, url) {
+            checkRequest(url, 'WEBRTC', function (blocked) {
+                if (blocked) {
+                    try {
+                        closeRTCPeerConnection(connection);
+                    } catch (e) {
+                        // Ignore exceptions
+                    }
+                }
+            });
+        }
+
+        /**
+         * Check each URL of ice server in configuration for blocking.
+         *
+         * @param connection RTCPeerConnection
+         * @param configuration Configuration for RTCPeerConnection
+         * https://developer.mozilla.org/en-US/docs/Web/API/RTCConfiguration
+         */
+        function checkConfiguration(connection, configuration) {
+
+            if (!configuration || !configuration.iceServers) {
+                return;
+            }
+
+            var iceServers = configuration.iceServers;
+            for (var i = 0; i < iceServers.length; i++) {
+
+                var iceServer = iceServers[i];
+                if (!iceServer) {
+                    continue;
+                }
+
+                if (iceServer.url) {
+                    checkWebRTCRequest(connection, iceServer.url);
+                }
+
+                if (iceServer.urls) {
+                    for (var j = 0; j < iceServer.urls.length; j++) {
+                        checkWebRTCRequest(connection, iceServer.urls[j]);
+                    }
+                }
+            }
+        }
+
+        /**
+         * Overrides setConfiguration method
+         * https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setConfiguration
+         */
+        if (RealRTCPeerConnection.prototype.setConfiguration) {
+
+            var realSetConfiguration = Function.prototype.call.bind(RealRTCPeerConnection.prototype.setConfiguration);
+
+            RealRTCPeerConnection.prototype.setConfiguration = function (configuration) {
+                configuration = protectConfiguration(configuration);
+                // Call the real method first, so that validates the configuration
+                realSetConfiguration(this, configuration);
+                checkConfiguration(this, configuration);
+            };
+        }
+
+        function WrappedRTCPeerConnection(configuration, arg) {
+
+            if (!(this instanceof WrappedRTCPeerConnection)) {
+                return RealRTCPeerConnection();
+            }
+
+            configuration = protectConfiguration(configuration);
+
+            /**
+             * The old webkitRTCPeerConnection constructor takes an optional second argument and we must pass it.
+             */
+            var connection = new RealRTCPeerConnection(configuration, arg);
+            checkConfiguration(connection, configuration);
+            return connection;
+        }
+
+        WrappedRTCPeerConnection.prototype = RealRTCPeerConnection.prototype;
+
+        var boundWrappedRTCPeerConnection = WrappedRTCPeerConnection.bind();
+        copyProperties(RealRTCPeerConnection, boundWrappedRTCPeerConnection, ["caller", "generateCertificate", "name", "prototype"]);
+        RealRTCPeerConnection.prototype.constructor = boundWrappedRTCPeerConnection;
+
+        if ("RTCPeerConnection" in window) {
+            window.RTCPeerConnection = boundWrappedRTCPeerConnection;
+        }
+        if ("webkitRTCPeerConnection" in window) {
+            window.webkitRTCPeerConnection = boundWrappedRTCPeerConnection;
+        }
+    };
+
+    if (shouldOverrideWebSocket) {
+        overrideWebSocket();
+    }
+
+    if (shouldOverrideWebRTC) {
+        overrideWebRTC();
+    }
+})('wrapper-script-3114556144148183', false, true);
+} catch (ex) { console.error('Error executing AG js: ' + ex); }
+(function () {
+            var current = document.currentScript;
+            var parent = current && current.parentNode;
+            if (parent) {
+                parent.removeChild(current);
+            }
+        })();</script><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">
+  
+<title>Detokenizers for Microsoft BASICs</title>
+<script type="text/javascript">
+//<![CDATA[
+var gs_d=new Date,DoW=gs_d.getDay();gs_d.setDate(gs_d.getDate()-(DoW+6)%7+3);
+var ms=gs_d.valueOf();gs_d.setMonth(0);gs_d.setDate(4);
+var gs_r=(Math.round((ms-gs_d.valueOf())/6048E5)+1)*gs_d.getFullYear();
+var gs_p = (("https:" == document.location.protocol) ? "https://" : "http://");
+document.write(unescape("%3Cscript src='" + gs_p + "s.gstat.orange.fr/lib/gs.js?"+gs_r+"' type='text/javascript'%3E%3C/script%3E"));
+//]]>
+</script>
+<link href="data:text/css,%0A%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20ddg-runtime-checks%20%7B%0A%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20display%3A%20none%3B%0A%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%20%20%20%20%20%20" rel="stylesheet" type="text/css" media=""></head>
+<body>
+<h1 align="center">Detokenizers for Microsoft BASICs</h1>
+
+<p>In the 1970s and the 1980s, computer memory was
+expensive. The 8bit microcomputers came with a RAM ranging from 1
+kilobyte (the Sinclair ZX-81) to about 64 kilobytes (the Commodore 64,
+Atari 800 XL or the Amstrad CPC 464), which was the maximum adressable
+by an 8 bit microprocessor with 16 bit address range. On the 16 bit
+microcomputers the memory was about 512 kilobytes (Atari 520 ST or the
+Amstrad PC1512) to 640 kilobytes (most IBM PC compatibles). A typical
+5''1/4 floppy disk would store in double density about 360 kilobytes
+of data. With such
+a low memory, storing BASIC programs in plaintext in the computer
+RAM or on floppies would have exhausted the available space very quickly. The
+solution to that problem was to replace BASIC keywords in the program
+by single byte codes called tokens (or sometimes opcodes). Nowadays,
+having about a gigabyte of memory on a laptop computer is common, 
+and tokenizing interpreted languages to save memory is not necessary. 
+However, old BASIC programs saved on floppies are generally in the
+tokenized format which makes them unreadable without the BASIC
+interpreter that created them in the first place. One solution is to
+run the original BASIC interpreter in an emulator, but this is often 
+impossible without the original ROMs of the emulated machine. So, even 
+if the BASIC program files on the floppies can be copied to
+Unix/MacOS/Windows filesystem, listing them requires a detokenizer
+that turns the tokens back into the original BASIC keywords.</p> 
+
+<p>There are unfortunately many dialects of BASIC, and there is no 
+single manner to tokenize BASIC programs. As a result there is a wide 
+variety of formats of tokenized BASIC files (usually at least one per 
+line of 8 bit computer for each computer maker of the 70s and 80s). 
+Somewhat fortunately, many computer makers were using some version of
+  Microsoft BASIC on their computers. Although the different Microsoft
+  BASICs can use different codes for the same keywords, they have some
+  codes in common, and often share the same internal representation
+  for the BASIC program line and numerical constants. The changes to
+  turn a detokenizer for one flavor of microsoft BASIC into a
+  detokenizer for a different flavor are often minimal. </p>
+
+<p>The package <a href="http://edmond.orignac.pagesperso-orange.fr/msbasic2ascii-0.2.tar.gz">msbasicascii</a> is a
+set of seven detokenizers for GW-Basic, MSX-Basic, MBASIC, Dragon 32
+  BASIC  and TRS-80 Basics (Level II, Model 4, and CoCo), based on the original detokenizer for GW-Basic
+  written by Christian A. Ratcliff. It has been compiled on Linux with
+  gcc and GNU make and should be portable to Unix/*BSD/MacOSX. For
+  Windows, it could be necessary to find a replacement
+  for <tt>curses</tt> or <tt>termcap</tt> libraries. In any case, the
+  program is a text mode application that runs in a terminal emulator
+  window. It has been tested for the first
+  all BASICs  and has given satisfactory results, but it has not been
+  tested with the Dragon 32 BASIC. Some untested programs for Ohio
+  Scientific, Nascom, Compucolor and Exidy Sorcerer are also included.</p>  
+
+<table border="3" align="center"><caption>The various Microsoft
+    BASICs</caption> 
+  <tbody><tr><th> BASIC interpreter</th><th>Double opcodes</th><th>Arithmetic</th> </tr> 
+      <tr><td> <a href="http://trs-80.com/wordpress2/level-ii-reference/">TRS-80 Basic Level II</a> </td><td>No</td><td>Floating Point</td> </tr>
+      <tr><td> <a href="http://www.bitsavers.org/pdf/exidy/DP5002_A_Short_Tour_Of_BASIC_Jul78.pdf">Exidy Sorcerer ROM-PAC
+      Basic</a> </td><td>No</td><td>Floating Point</td> </tr><tr><td> <a href="http://www.nascomhomepage.com/pdf/Basic.pdf">Nascom
+      Basic</a> </td><td>No</td><td>Floating Point</td> </tr>
+       <tr><td><a href="http://www.bitsavers.org/pdf/ohioScientific/Basic_Ref_Manual_Sep78.pdf"> Ohio Scientific  Basic</a> </td><td>No</td><td>Floating Point</td> </tr>
+	  <tr><td><a href="http://www.bitsavers.org/pdf/microsoft/cpm/Microsoft_BASIC-80_5.0_Reference_1979.pdf">Microsoft
+	  BASIC (MBASIC) for CP/M 80</a> </td><td>Yes</td><td>Floating
+	  Point</td> </tr>
+<tr><td> <a href="http://archive.worldofdragon.org/index.php?title=An_introduction_to_BASIC_programming_using_the_DRAGON">Dragon 32/64</a>  </td><td>Yes</td><td>Floating
+	  Point (?)</td></tr>
+<tr> <td> <a href="http://www.cs.unc.edu/~yakowenk/coco.html">TRS-80 Color Computer</a>  </td><td>Yes</td><td>Floating
+	  Point (?)</td></tr>
+	   <tr><td> <a href="http://www.msxarchive.nl/pub/msx/docs/manuals/msxtech.pdf">MSX-Basic</a> </td><td>Yes</td><td>Binary Coded Decimal</td> </tr> 
+            <tr><td><a href="http://www.antonis.de/qbebooks/gwbasman/index.html">GW-Basic/BASICA</a> </td> <td>Yes (3 sorts)</td><td>Floating Point</td></tr>
+	      </tbody></table>
+   
+<p> In all the Microsoft BASICs, the tokenized program file begins
+  with <tt>0xff</tt>. Each line begins with two bytes that indicate
+  the address of the next line, and two other bytes that contain the
+  line number. Tokens of BASIC keywords, numerical constants and
+  variable names follow. The line is terminates with a byte set to
+  zero. </p>
+
+Let us give one example (for MBASIC on CP/M-80). The first line is a
+BASIC line, the second line its tokenized form in hexadecimal notation
+(obtained with <tt>hexdump -C</tt>).   
+<listing>       125    FOR   I  =  1     TO    4     
+ cb 62 7d 00  82 20 49 f0 12 20 ce 20 15 00
+</listing> 
+
+The first two bytes contain the address of the next line, so we can
+ignore them. The next two bytes are <tt>0x7d</tt> (hexadecimal) which
+is <tt>7*16+13=125</tt> (decimal) and <tt>0</tt>. In general the line
+number is equal to <tt>(second byte)*256 + (first byte)</tt> in
+decimal. This is followed by the token <tt>0x82</tt> that corresponds
+to the BASIC keyword <tt>FOR</tt>, a space (ASCII code <tt>0x20</tt>
+in hexadecimal) the variable name <tt>I</tt> (ASCII
+code <tt>0x49</tt>) the token <tt>0xf0</tt> that corresponds
+to the BASIC keyword <tt>=</tt>, <tt>0x12</tt> that encodes the single
+byte constant 1, a space, <tt>0xce</tt>that corresponds
+to the BASIC keyword <tt>TO</tt> and  <tt>0x15</tt> that encodes the single
+byte constant 4. The <tt>00</tt> terminates the line. 
+
+
+
+<h2>BASICA/GWBasic</h2>
+
+<p>BASICA was the Basic interpreter of the IBM PC. GW-Basic was used
+  on IBM PC compatible and MSDOS compatible computers. As explain on the
+page <a href="http://www.chebucto.ns.ca/~af380/GW-BASIC-tokens.html">GW-BASIC
+  tokenised program format</a>, it uses double tokens (opcodes) to represent
+  some BASIC keywords. This means that for instance, the keyword CVI
+  is represented by the sequence of two bytes <tt>Oxfd 0x81</tt> (in
+  hexadecimal base). It has the most complicated double opcodes
+  sequences, since <tt>0xfd,0xfe,and 0xfe</tt> can appear as the
+  first byte.</p>  
+<p>GW-Basic contains all the different representations of numeric
+  constants used in Microsoft BASICs. It uses the floating point
+  representation for real number in both single precision (4 bytes)
+  and double precision (8 bytes). 
+
+</p><h2>MSX-Basic</h2> 
+MSX was a standard for home computers based on Zilog Z80 8bit
+microprocessors originally developped in Japan by ASCII corporation in
+the 1980s and adopted by Japanese and South Korean home computer
+makers, as well as by Philipps in the Netherlands. A Basic interpreter
+was developped for MSX computers by Microsoft. Contrarily to GW-BASIC,
+the MSX computers use a Binary Coded Decimal representation for
+real numerical constants. In Binary Coded Decimal, two figures of a
+decimal number are stored in a single byte, so that for instance 
+<tt>12 34</tt> in hexadecimal (i. e. <tt>1*16+2=18 3*16+4=52</tt> in
+decimal) represents <tt>12 34</tt> in decimal. The advantage over
+binary floating point representation is that quantities such
+as <tt>1/5=0.2</tt> can be represented exactly with Binary Coded
+Decimal, while in binary floating point, a truncation would occur. 
+This can be useful in financial computation. However, this
+representation is less economical in computer memory, and less
+efficient in terms of speed of calculation. MSX-Basic is using both 
+single and double opcodes, however double opcodes always start
+with <tt>0xff</tt>. The list of opcodes is available from
+the <a href="http://www.konamiman.com/msx/msx2th/th-2.txt">MSX2
+  Technical manual</a>. 
+
+<h2>Microsoft BASIC for CP/M</h2>
+CP/M was a operating system for 8 bit microcomputers based on Intel
+8080, Zilog Z80 and Intel 8085 chips. It was developped by Digital
+Research at the end of the 70s, and was used mainly on professional
+computers. Microsoft developped a BASIC interpreter for CP/M, MBASIC. 
+This basic uses a binary floating point number representation for
+reals, as GW-BASIC, but only uses double opcodes starting
+with <tt>0xff</tt>.
+
+<h2>TRS-80 Basic Level II</h2>
+The <a href="http://www.trs-80.com/">TRS/80</a> 
+was a popular computer manufactured by Tandy Radio Shack in
+the 1980s. The Basic Level II is a Microsoft BASIC that does not use
+dual opcodes, and represents real number with binary floating point. 
+The opcodes are available from Ira Goldkland's
+site. See <a href="http://www.trs-80.com/wordpress/zaps-patches-pokes-tips/internal/">Tokenized
+  BASIC</a>.
+
+<h2>TRS-80 Model 4 Basic</h2>
+The <a href="http://www.trs-80.com/">TRS/80 Model 4</a> was the
+successor of the Model I. The Model 4 Basic differs from the Level II
+Basic by the use of dual opcodes. The opcodes are also available from
+Ira Goldkland's
+site. See <a href="http://www.trs-80.com/wordpress/zaps-patches-pokes-tips/internal/">Tokenized
+  BASIC</a>.     
+
+
+<h2>Miscellaneous</h2>
+The <a href="http://osiweb.org/osiweb/">Ohio Scientific</a> 8K Basic in
+  ROM,<a href="http://www.nascomhomepage.com/"> NASCOM</a> Basic and
+the <a href="http://www.classic-computers.org.nz/collection/exidy-sorcerer.htm">Exidy
+  Sorcerer</a>  ROM-PAC
+Basic are similar to the TRS-80 Basic Level II. 
+
+The tokens for the Ohio
+Scientific have been published in <a href="http://www.6502.org/documents/publications/micro/micro_15_aug_1979.pdf">MICRO n°15, p. 20 (1979)</a>
+and <a href="http://www.archive.org/stream/1980-01-compute-magazine/Compute_Issue_002_1980_Jan_Feb#page/n121/mode/2up/search/tokens">Compute
+  n°2, p. 121 (1980)</a>. In
+the
+<a href="http://www.computer-museum.nl/Exidy/SorcerersApprentice_Vol3_No4.pdf">Sorcerer's Apprentice vol. 3, n° 4, p. 77 (1981)</a> a table of correspondence
+between TRS-80 tokens and Sorcerer tokens is available. However, this
+table contains some errors and is incomplete (<tt>LOG</tt> is
+missing). In <a href="http://www.nascomhomepage.com/pdf/MPV01N03.zip">Micropower
+  vol. 1 n°3 p. 18 (1981)</a> a similar table appears for NASCOM Basic
+and Crystal Basic.  
+
+<a href="http://edmond.orignac.pagesperso-orange.fr/basic.html">[Return to the BASIC on Linux page]</a>
+       
+
+<script type="text/javascript">
+//<![CDATA[
+if (typeof _gstat != "undefined") _gstat.audience('','pagesperso-orange.fr');
+//]]>
+</script>
+
+
+</body></html>
