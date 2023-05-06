@@ -1,0 +1,66 @@
+* Edmond Orignac Fri Nov 11, 2011
+
+o gwb_interpreter.h: 
+Added a complete list of GW-BASIC keywords and corresponding opcodes 
+taken from page
+http://www.chebucto.ns.ca/~af380/GW-BASIC-tokens.html   
+Added dual opcodes 0xfe,0xfd 
+
+o gwb_interpreter.c:
+
+Corrected parsing of double precision numerical constants 
+Added treatment of dual opcodes 
+ 
+o msx_interpreter.h 
+Added a complete list of GW-BASIC keywords and corresponding opcodes 
+from the MSX2 Technical Book. 
+
+o gwb_interpreter.c:
+
+Inserted parsing of numerical constants in Binary Coded Decimal 
+(single and double precision)  
+
+o trs80.h 
+Inserted a list of Level II Basic opcodes from Ira Goldklang's site
+
+o trs_interpreter.c:
+
+Removed dual opcodes (TRS-80 Basic Level II uses only single opcodes). 
+
+o gwb_interpreter.c:
+
+Corrected parsing of double precision numerical constants 
+Added treatment of dual opcodes 
+ 
+o cpm_interpreter.h 
+Added a complete list of Microsoft BASIC for CP/M-80 keywords and 
+corresponding opcodes.  
+
+Sat Nov 26 2011
+
+o dragon.c/coco.c 
+detokenizers for Dragon 32 and Tandy Color Computer (CoCo) 
+
+o dragon32.h and coco.h 
+Added a list of keywords/opcodes from dragon.info 
+
+o sorcerer.c 
+detokenizer for Exidy Sorcerer Basic 
+
+o exidy.h 
+keywords/opcodes for the Exidy Sorcerer (taken from the Sorcerer's Apprentice). 
+This is unfinished, in particular the LOG function was missing. 
+
+o osi.c 
+detokenizer for Ohio Scientific Instruments (OSI) 8K Basic in ROM 
+
+o osi.h 
+keywords/opcodes from Compute n°2 (Jan-Feb. 1980) p. 121 
+
+  
+21 Dec 2020 
+
+o trsm4.c and model4.h 
+for TRS80 model 4 
+o gwb_commands.c
+fix a bug that caused coredumps when listing programs
